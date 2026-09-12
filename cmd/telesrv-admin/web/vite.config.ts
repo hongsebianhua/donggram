@@ -10,7 +10,7 @@ export default defineConfig({
   server: {
     port: 2410,
     proxy: {
-      "/api": "http://127.0.0.1:2600"
+      "/api": "http://111.229.87.208:2600"
     }
   }
 });
