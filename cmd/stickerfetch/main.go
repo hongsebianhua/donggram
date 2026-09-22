@@ -11,8 +11,18 @@
 //	emoji_default_topic_icons    inputStickerSetEmojiDefaultTopicIcons
 //	premium_gifts                inputStickerSetPremiumGifts
 //	ton_gifts                    inputStickerSetTonGifts
+//	animated_emoji               inputStickerSetAnimatedEmoji
+//	animated_emoji_animations    inputStickerSetAnimatedEmojiAnimations
+//	emoji_generic_animations     inputStickerSetEmojiGenericAnimations
+//	dice:<emoji>                 inputStickerSetDice{Emoticon: <emoji>}
+//
+// 拉取结果直接放进 data/sticker-seed/telegram_default_stickers_export/<setdir>/ 即可被
+// seedStickerSets 识别(目录名不匹配 DefaultSet_* 时,会按 set_info.json 的 input_set_type
+// 回退归类到对应 system_key,无需手动改名)。
 //
 // 需登录会话(复用 appearancefetch 的 /tmp/appearance.session,SESSION env 可覆盖)。
+// 直连 Telegram DC 若被网络墙掉,可设 SOCKS5_PROXY=host:port(或 socks5://user:pass@host:port)
+// 走代理拨号,系统级代理设置对本工具的 net.Dial 无效。
 //
 // 用法: SESSION=/tmp/appearance.session stickerfetch <out_dir> <spec> [spec...]
 package main
@@ -22,14 +32,21 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/iamxvbaba/td/telegram"
+	"github.com/iamxvbaba/td/telegram/dcs"
 	"github.com/iamxvbaba/td/telegram/downloader"
 	"github.com/iamxvbaba/td/tg"
+	"go.uber.org/zap"
+	"golang.org/x/net/proxy"
+
+	logzap "github.com/gotd/log/logzap"
 )
 
 const (
@@ -42,6 +59,67 @@ func sessionPath() string {
 		return p
 	}
 	return "/tmp/appearance.session"
+}
+
+// socks5ProxyDialer 解析 SOCKS5_PROXY(host:port 或 socks5://user:pass@host:port),让本工具在
+// 直连 Telegram DC 被墙的网络下也能走代理(系统级代理设置对 Go net.Dial 无效)。
+func socks5ProxyDialer() (proxy.Dialer, error) {
+	raw := strings.TrimSpace(os.Getenv("SOCKS5_PROXY"))
+	if raw == "" {
+		return nil, nil
+	}
+	var address string
+	var auth *proxy.Auth
+	if strings.Contains(raw, "://") {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return nil, err
+		}
+		if parsed.Scheme != "socks5" {
+			return nil, fmt.Errorf("scheme must be socks5, got %q", parsed.Scheme)
+		}
+		host, port, err := net.SplitHostPort(parsed.Host)
+		if err != nil {
+			return nil, fmt.Errorf("must be host:port or socks5://host:port: %w", err)
+		}
+		address = net.JoinHostPort(host, port)
+		if parsed.User != nil {
+			password, _ := parsed.User.Password()
+			auth = &proxy.Auth{User: parsed.User.Username(), Password: password}
+		}
+	} else {
+		host, port, err := net.SplitHostPort(raw)
+		if err != nil {
+			return nil, fmt.Errorf("must be host:port or socks5://host:port: %w", err)
+		}
+		address = net.JoinHostPort(host, port)
+	}
+	return proxy.SOCKS5("tcp", address, auth, proxy.Direct)
+}
+
+func telegramOptions() (telegram.Options, error) {
+	opts := telegram.Options{
+		SessionStorage: &telegram.FileSessionStorage{Path: sessionPath()},
+	}
+	dialer, err := socks5ProxyDialer()
+	if err != nil {
+		return telegram.Options{}, fmt.Errorf("invalid SOCKS5_PROXY: %w", err)
+	}
+	if dialer != nil {
+		opts.Resolver = dcs.Plain(dcs.PlainOptions{
+			Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			},
+		})
+	}
+	if os.Getenv("TG_DEBUG") != "" {
+		zapLog, err := zap.NewDevelopment()
+		if err != nil {
+			return telegram.Options{}, err
+		}
+		opts.Logger = logzap.New(zapLog)
+	}
+	return opts, nil
 }
 
 func specToInput(spec string) (tg.InputStickerSetClass, string, error) {
@@ -59,6 +137,15 @@ func specToInput(spec string) (tg.InputStickerSetClass, string, error) {
 		return &tg.InputStickerSetPremiumGifts{}, "PremiumGifts", nil
 	case spec == "ton_gifts":
 		return &tg.InputStickerSetTonGifts{}, "TonGifts", nil
+	case spec == "animated_emoji":
+		return &tg.InputStickerSetAnimatedEmoji{}, "AnimatedEmoji", nil
+	case spec == "animated_emoji_animations":
+		return &tg.InputStickerSetAnimatedEmojiAnimations{}, "AnimatedEmojiAnimations", nil
+	case spec == "emoji_generic_animations":
+		return &tg.InputStickerSetEmojiGenericAnimations{}, "EmojiGenericAnimations", nil
+	case strings.HasPrefix(spec, "dice:"):
+		emoticon := strings.TrimPrefix(spec, "dice:")
+		return &tg.InputStickerSetDice{Emoticon: emoticon}, "Dice", nil
 	default:
 		return nil, "", fmt.Errorf("unknown spec %q", spec)
 	}
@@ -161,7 +248,7 @@ func mapAttrs(in []tg.DocumentAttributeClass) []attrJSON {
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: SESSION=/tmp/appearance.session stickerfetch <out_dir> <spec> [spec...]\n  spec: short:<name> | emoji_default_statuses | emoji_channel_default_statuses | emoji_default_topic_icons | premium_gifts | ton_gifts | effects")
+		fmt.Fprintln(os.Stderr, "usage: SESSION=/tmp/appearance.session stickerfetch <out_dir> <spec> [spec...]\n  spec: short:<name> | emoji_default_statuses | emoji_channel_default_statuses | emoji_default_topic_icons | premium_gifts | ton_gifts | animated_emoji | animated_emoji_animations | emoji_generic_animations | dice:<emoji> | effects")
 		os.Exit(2)
 	}
 	out := os.Args[1]
@@ -170,9 +257,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 
-	client := telegram.NewClient(tdesktopAPIID, tdesktopAPIHash, telegram.Options{
-		SessionStorage: &telegram.FileSessionStorage{Path: sessionPath()},
-	})
+	opts, err := telegramOptions()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		os.Exit(2)
+	}
+	client := telegram.NewClient(tdesktopAPIID, tdesktopAPIHash, opts)
 	if err := client.Run(ctx, func(ctx context.Context) error {
 		api := client.API()
 		if status, err := client.Auth().Status(ctx); err != nil || !status.Authorized {

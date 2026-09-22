@@ -3,6 +3,8 @@
 // 复用 internal/seed/appearance 的结构体保证 schema 完全一致。peer_colors 从现有 JSON 沿用。
 //
 // 需登录(墙纸/主题接口非免登)。api 凭据用 TDesktop 开源公开的 id/hash。
+// 直连 Telegram DC 若被网络墙掉,可设 SOCKS5_PROXY=host:port(或 socks5://user:pass@host:port)
+// 走代理拨号,系统级代理设置对本工具的 net.Dial 无效。
 // 子命令:
 //
 //	appearancefetch sendcode              env: PHONE              发送登录码,打印 CODE_HASH
@@ -17,14 +19,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/iamxvbaba/td/telegram"
 	"github.com/iamxvbaba/td/telegram/auth"
+	"github.com/iamxvbaba/td/telegram/dcs"
 	"github.com/iamxvbaba/td/telegram/downloader"
 	"github.com/iamxvbaba/td/tg"
+	"go.uber.org/zap"
+	"golang.org/x/net/proxy"
+
+	logzap "github.com/gotd/log/logzap"
 
 	"telesrv/internal/seed/appearance"
 )
@@ -41,6 +51,67 @@ func sessionPath() string {
 	return "/tmp/appearance.session"
 }
 
+// socks5ProxyDialer 解析 SOCKS5_PROXY(host:port 或 socks5://user:pass@host:port),让本工具在
+// 直连 Telegram DC 被墙的网络下也能走代理(系统级代理设置对 Go net.Dial 无效)。
+func socks5ProxyDialer() (proxy.Dialer, error) {
+	raw := strings.TrimSpace(os.Getenv("SOCKS5_PROXY"))
+	if raw == "" {
+		return nil, nil
+	}
+	var address string
+	var auth *proxy.Auth
+	if strings.Contains(raw, "://") {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return nil, err
+		}
+		if parsed.Scheme != "socks5" {
+			return nil, fmt.Errorf("scheme must be socks5, got %q", parsed.Scheme)
+		}
+		host, port, err := net.SplitHostPort(parsed.Host)
+		if err != nil {
+			return nil, fmt.Errorf("must be host:port or socks5://host:port: %w", err)
+		}
+		address = net.JoinHostPort(host, port)
+		if parsed.User != nil {
+			password, _ := parsed.User.Password()
+			auth = &proxy.Auth{User: parsed.User.Username(), Password: password}
+		}
+	} else {
+		host, port, err := net.SplitHostPort(raw)
+		if err != nil {
+			return nil, fmt.Errorf("must be host:port or socks5://host:port: %w", err)
+		}
+		address = net.JoinHostPort(host, port)
+	}
+	return proxy.SOCKS5("tcp", address, auth, proxy.Direct)
+}
+
+func telegramOptions() (telegram.Options, error) {
+	opts := telegram.Options{
+		SessionStorage: &telegram.FileSessionStorage{Path: sessionPath()},
+	}
+	dialer, err := socks5ProxyDialer()
+	if err != nil {
+		return telegram.Options{}, fmt.Errorf("invalid SOCKS5_PROXY: %w", err)
+	}
+	if dialer != nil {
+		opts.Resolver = dcs.Plain(dcs.PlainOptions{
+			Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.Dial(network, addr)
+			},
+		})
+	}
+	if os.Getenv("TG_DEBUG") != "" {
+		zapLog, err := zap.NewDevelopment()
+		if err != nil {
+			return telegram.Options{}, err
+		}
+		opts.Logger = logzap.New(zapLog)
+	}
+	return opts, nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: appearancefetch sendcode | appearancefetch fetch <out_dir> <carry_json>")
@@ -50,10 +121,13 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
-	client := telegram.NewClient(apiID, apiHash, telegram.Options{
-		SessionStorage: &telegram.FileSessionStorage{Path: sessionPath()},
-	})
-	err := client.Run(ctx, func(ctx context.Context) error {
+	opts, err := telegramOptions()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR:", err)
+		os.Exit(2)
+	}
+	client := telegram.NewClient(apiID, apiHash, opts)
+	err = client.Run(ctx, func(ctx context.Context) error {
 		switch cmd {
 		case "sendcode":
 			return doSendCode(ctx, client)
